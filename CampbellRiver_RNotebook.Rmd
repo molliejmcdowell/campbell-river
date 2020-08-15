@@ -1,0 +1,1077 @@
+---
+title: "Code for: Impacts of forest harvest on the electrical conductivity of a stream near Campbell River, British Columbia"
+author: "Mollie J. McDowell"
+output:
+  pdf_document:
+    fig_caption: true
+    toc: true
+    toc_depth: 5
+---
+
+<style type="text/css">
+
+h1.title {
+  font-size: 28px;
+  text-align: center;
+}
+h4.author {
+  font-size: 20px;
+  text-align: center;
+}
+</style>
+
+This notebook contains code associated with a [GEOB 503](https://ibis.geog.ubc.ca/courses/geob503/) / [UBC Ecohydrology](https://ecohydro.ires.ubc.ca/) research project analyzing water quality impacts of forest harvest in a headwater stream near Campbell River, BC. Dr. Mark Johnson and Dr. R. D. Moore provided supervision and academic guidance. Dan Hadley, Boyi Hu, Tae Yoon (Harry) Lee, and Shanshan Pi provided statistical and coding consultation via a STAT 550 project.
+
+Data sources: UBC Ecohydrology, UBC Biometeorology, BC Ministry of Transportation
+
+Load packages:
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(pacman)
+p_load(tidyverse, nlme, EcoHydRology, stats, car, lmtest, lubridate, forecast, cowplot, zoo, reshape2, hydroGOF, car, SDMTools, openair, imputeTS, tseries, mice, forecast, missForest, mi, data.table, knitr, TTR, graphics, MASS, timeDate, stargazer, pander)
+```
+
+# 1 Dataset merging
+
+## 1.1 Read in original datasets
+
+Water quality (Ecohydro): EC, Q, stream temp
+Biomet: air temp [precipitation not used because MOT is better]
+Ministry of Transportation: precipitation (hourly)
+```{r, eval = F}
+wq.data <- readRDS("CR_WQ30.2009_Apr2015.cleaning in prog 27Jan2016,mollie.RDS")
+biomet.data <- readRDS("Biomet.2009_Apr2014,mollie.RDS")
+mot.data <- read.csv("NorthCourtney_climate_BC_MOT.csv")
+```
+
+## 1.2 Merge datasets
+
+Water quality data: 
+* extract and rename relevant columns 
+* set others to NULL
+* subset continuous data
+```{r, eval = F}
+names(wq.data)[names(wq.data) == "ECond.cleaned"] = "ec"
+names(wq.data)[names(wq.data) == "Q.L.s.cleaned2X"] = "q"
+names(wq.data)[names(wq.data) == "tv.30"] = "date.time"
+names(wq.data)[names(wq.data) == "Tw"] = "stream.temp"
+
+wq.data$Batt_V <- NULL
+wq.data$DO <- NULL
+wq.data$ORP <- NULL
+wq.data$pH <- NULL
+wq.data$CO2.GW.cleaned <- NULL
+wq.data$CO2.SW.cleaned <- NULL
+
+wq.subset <- wq.data[-(103157:109661), ]
+```
+
+Biomet data: extract and rename relevant columns
+```{r, eval = F}
+names(biomet.data)[names(biomet.data) == "Tair"] = "air.temp"
+names(biomet.data)[names(biomet.data) == "tv.30"] = "date"
+names(biomet.data)[names(biomet.data) == "Precip.mm"] = "precip.mm"
+```
+
+MOT data: 
+* extract precip info
+* change datetime to GMT
+* assign missing NA values because of daylight savings
+* create new dataframe for just dates and hourly precip
+```{r, eval = F}
+mot.data$DATETIME <- as.POSIXct(mot.data$DATETIME, tz = "America/Los_Angeles", format = "%m/%d/%y %H:%M")
+mot.data$dtgmt <- force_tzs(mot.data$DATETIME, tzone = "America/Los_Angeles", tzone_out = "UTC")
+
+mot.data$dtgmt[1635] <- "2008-03-09 03:00:00"
+mot.data$dtgmt[10369] <- "2009-03-08 03:00:00"
+mot.data$dtgmt[18952] <- "2010-03-14 03:00:00"
+mot.data$dtgmt[27668] <- "2011-03-13 03:00:00"
+mot.data$dtgmt[36403] <- "2012-03-11 03:00:00"
+mot.data$dtgmt[45138] <- "2013-03-10 03:00:00"
+mot.data$dtgmt[53873] <- "2014-03-09 03:00:00"
+
+mot.data.new <- mot.data[,c("dtgmt","HRLY_PRCP")]
+mot.data.new$HRLY_PRCP <- ifelse(mot.data.new$HRLY_PRCP < 0, 0, mot.data.new$HRLY_PRCP)
+#write.csv(mot.data.new, "motdatagmt.csv")
+```
+
+Merge water quality and biomet data
+* cr.df: date.time, ec, q, st, at
+* make negative values NA for all variables except air temp
+* average cr.df by an hour to combine with MOT data -> cr.df.hr
+```{r, eval = F}
+cr.df <- cbind(wq.subset, biomet.data$air.temp)
+cr.df <- as.data.frame(cr.df)
+names(cr.df)[names(cr.df) == "biomet.data$air.temp"] = "at"
+names(cr.df)[names(cr.df) == "stream.temp"] = "st"
+
+cr.df$ec <- ifelse(cr.df$ec < 0, NA, cr.df$ec)
+cr.df$q <- ifelse(cr.df$q < 0, NA, cr.df$q)
+cr.df$st <- ifelse(cr.df$st < 0, NA, cr.df$st)
+
+cr.df$date <- as.POSIXct(cr.df$date.time)
+cr.df.hr <- timeAverage(cr.df, avg.time = "1 hour")
+tz(cr.df.hr$date)
+```
+
+Join cr.df.hr and MOT data
+* change name of mot.data.new dtgmt to date so that join works
+* join cr.df.hr and mot.data.new (inner join?)
+* change name to cr.df so that the rest of this script works
+* change any negative motp to 0
+```{r, eval = F}
+mot.data.new$date <- mot.data.new$dtgmt
+
+cr.mot.df <- inner_join(cr.df.hr, mot.data.new, by = "date")
+cr.mot.df[2] <- NULL
+cr.mot.df[6] <- NULL
+
+cr.df <- cr.mot.df
+names(cr.df)[names(cr.df) == "HRLY_PRCP"] = "motp"
+
+cr.df$motp <- ifelse(cr.df$motp < 0, 0, cr.df$motp)
+```
+
+Drop EC outliers:
+```{r}
+cr.df$ec[380:382] <- NA
+cr.df$ec[411] <- NA
+```
+
+## 1.4 Aggregating to daily data
+* aggregate to daily mean
+* first need to create new variable for each day
+* aggregate function for aggregating by mean
+* combine into one data frame - ag.df
+* include sine and cosine of day of year
+
+```{r, eval = F}
+day <- strftime(cr.df$date, "%d")
+cr.df$day <- floor_date(cr.df$date, "day")
+
+st <- aggregate(cr.df$st, by = list(cr.df$day), FUN = mean, simplify = TRUE)
+at <- aggregate(cr.df$at, by = list(cr.df$day), FUN = mean, simplify = TRUE)
+q <- aggregate(cr.df$q, by = list(cr.df$day), FUN = mean, simplify = TRUE)
+bf <- aggregate(cr.df$bf, by = list(cr.df$day), FUN = mean, simplify = TRUE)
+ec <- aggregate(cr.df$ec, by = list(cr.df$day), FUN = mean, simplify = TRUE)
+p <- aggregate(cr.df$motp, by = list(cr.df$day), FUN = mean, simplify = TRUE) # changed from p to motp to use MOT data
+
+ag.df <- cbind(st, at, q, bf, ec, p)
+
+ag.df[3] <- NULL
+ag.df[4] <- NULL
+ag.df[5] <- NULL
+ag.df[6] <- NULL
+ag.df[7] <- NULL
+
+colnames(ag.df) <- c("dt", "st", "at", "q", "bf", "ec", "p")
+
+# add day of year, sine and cosine of day of year
+doy <- strftime(ag.df$dt, "%j")
+doy <- as.numeric(doy)
+sin.doy <- sin(2*pi*doy/365.25)
+cos.doy <- cos(2*pi*doy/365.25)
+
+ag.df <- cbind(ag.df, doy, sin.doy, cos.doy)
+```
+
+## 1.5 Cleaning and merging new data
+* this data is new as of January 2017
+* extra Q and EC data
+
+Read files (30-min):
+```{r, eval = F}
+q.data <- readRDS("Q30m_2007_2014.RDS") # discharge data
+ec.data <- read.csv("EC2008_2009.csv") # conductivity data
+```
+
+Data cleaning:
+* extract subsets for which datasets overlap in time
+* merge into one dataframe (ec.q.df)
+* NA negative values
+```{r}
+ec.subset <- ec.data[-(33493:35088), ]
+ec.subset <- ec.subset[-(1:8344), ]
+q.subset <- q.data[(10608:35755), ]
+
+ec.q.df <- cbind(ec.subset, q.subset$Q.L.s)
+ec.q.df <- as.data.frame(ec.q.df)
+names(ec.q.df)[names(ec.q.df) == "q.subset$Q.L.s"] = "q2"
+names(ec.q.df)[names(ec.q.df) == "EC2"] = "ec2"
+ec.q.df$X <- NULL
+
+ec.q.df$ec2 <- ifelse(ec.q.df$ec2 < 0, NA, ec.q.df$ec2)
+ec.q.df$q2 <- ifelse(ec.q.df$q2 < 0, NA, ec.q.df$q2)
+```
+
+Data aggregation
+* make datetime a POSIX variable and extract day variable for aggregating
+* aggregate by mean
+* aggregated dataframe: ag.df2
+* include sine and cosine of day of year for regression stats
+```{r}
+ec.q.df$date <- parse_date_time(ec.q.df$date, orders = "mdy HM")
+day <- strftime(ec.q.df$date, "%d")
+ec.q.df$day <- floor_date(ec.q.df$date, "day")
+
+ec2 <- aggregate(ec.q.df$ec2, by = list(ec.q.df$day), FUN = mean, simplify = TRUE)
+q2 <- aggregate(ec.q.df$q2, by = list(ec.q.df$day), FUN = mean, simplify = TRUE)
+
+ag.df2 <- cbind(ec2, q2)
+ag.df2[3] <- NULL
+
+colnames(ag.df2) <- c("dt", "ec", "q")
+
+doy <- strftime(ag.df2$dt, "%j")
+doy <- as.numeric(doy)
+sin.doy <- sin(2*pi*doy/365.25)
+cos.doy <- cos(2*pi*doy/365.25)
+
+ag.df2 <- cbind(ag.df2, doy, sin.doy, cos.doy)
+```
+
+Merging old and new dataframes (ag.df and ag.df2)
+* include dates from ag.df2 to ag.df
+* create matrix and column names for new dataframe (df), use dates from ag.df2
+* left join to merge dataframes and replace NAs in old df with new data (stat.df)
+```{r}
+dates <- ag.df2$dt
+dates <- dates[1:193]
+
+df <- data.frame(matrix(ncol = 10, nrow = 193))
+colnames(df) <- c("dt", "st", "at", "q", "bf", "ec", "p", "doy", "sin.doy", "cos.doy")
+df$dt <- dates
+
+newag <- rbind(df, ag.df)
+
+stat.df <- left_join(newag, ag.df2, by = "dt")
+stat.df <- mutate(stat.df, ec = ifelse(is.na(ec.x), ec.y, ec.x))
+stat.df <- mutate(stat.df, q = ifelse(is.na(q.x), q.y, q.x))
+stat.df <- mutate(stat.df, doy = ifelse(is.na(doy.x), doy.y, doy.x))
+stat.df <- mutate(stat.df, sin.doy = ifelse(is.na(sin.doy.x), sin.doy.y, sin.doy.x))
+stat.df <- mutate(stat.df, cos.doy = ifelse(is.na(cos.doy.x), cos.doy.y, cos.doy.x))
+
+stat.df <- dplyr::select(stat.df, dt, st, at, q, bf, ec, p, doy, sin.doy, cos.doy)
+```
+
+```{r}
+stat.df[is.na(stat.df)] <- NA
+#write.csv(stat.df, "CRdailyall.csv")
+```
+
+```{r, message=FALSE, echo=FALSE}
+stat.df <- stat.df %>% mutate(date = as.Date(dt)) %>% 
+	mutate(months = month(dt)) %>% mutate(years = year(dt)) %>% 
+	mutate(season = ifelse((3 < months & months < 10), 1, 0))
+
+stat.df$months <- as.factor(stat.df$months)
+```
+
+## 1.6 Separate pre- and post-harvest data
+
+```{r}
+pre.df <- subset(stat.df, dt < as.POSIXct('2011-1-31 00:00:00'))
+post.df <- subset(stat.df, dt >= as.POSIXct('2011-5-31 00:00:00'))
+```
+
+```{r}
+#write.csv(pre.df, file = "preharvest.csv")
+#write.csv(post.df, file = "postharvest.csv")
+```
+
+# 2 Data cleaning and imputation
+* potential gap-filling methods: missforest (non-parametric randomforest method); spline interpolation (non-parametric - more conservative); MICE (assumes values are missing at random - uses predictive mean matching); MI (bayesian method)
+* creates gapfilled Q, gapfilled BF, and non-gapfilled BF
+
+## 2.1 Pre-harvest data cleaning
+
+Check dataframes:
+* row/columns and attributes
+* dates for pre and post harvest
+* number of NAs for relevant variables
+* plot pre and post EC
+* for the preharvest data, delete the first 300 (approx.) data points
+* for the postharvest data, stop where the last EC value is taken
+```{r}
+dim(pre.df); dim(post.df) # 10 columns; 954 and 1269 rows, respectively
+str(pre.df); str(post.df)
+
+head(pre.df);tail(pre.df) # 2008-06-22 to 2011-01-31
+head(post.df); tail(post.df) #2011-06-01 to 2014-11-20
+str(pre.df); summary(pre.df) # many missing values ec(216), q(176), st(356)
+str(post.df); summary(post.df) #many missing values ec(230), st(130)
+
+plot.ts(pre.df$ec); plot.ts(post.df$ec)
+```
+
+## 2.2 Data imputation
+
+```{r}
+imp <- function(x)
+{
+  m <- ncol(x)
+  for (i in 3:m)
+  {
+    x[,i] <- na.interpolation(x[,i], option="spline")
+  }
+  x
+}
+```
+
+### 2.2.1 Pre-harvest data imputation:
+
+First, plot data to find NAs:
+```{r}
+pre.df$ec[304:308] #306; drop the first 305 rows
+plot.ts(pre.df$q)
+pre.df$q[400:550] #100 missing here
+plot.ts(pre.df$st)
+pre.df$st[1:305] #all NA's
+```
+
+Create test dataframe for preharvest data:
+* remove first 305 rows (spotty EC data)
+* plot all variables to check for outliers
+```{r}
+test.pre.df <- pre.df[-(1:305),] %>% dplyr::select(ec,q,st,at,p, bf)
+head(test.pre.df);summary(test.pre.df)
+plot.ts(test.pre.df)
+```
+
+Replace outlier values for precipitation:
+```{r}
+test.pre.df$p[which.max(test.pre.df$p)]<- sort(test.pre.df$p, decreasing = T)[2] # Replace with next highest value
+plot.ts(test.pre.df$p) #good
+```
+
+MICE method:
+```{r}
+tmp.imp <- mice(test.pre.df,m=5,maxit=50,seed=550) #ec,q,st,p,bf
+
+summary(test.pre.df)
+rowMeans(tmp.imp$imp$ec)
+copy <- test.pre.df
+which(is.na(test.pre.df$ec)==T)
+copy$ec[which(is.na(test.pre.df$ec)==T)] <- rowMeans(tmp.imp$imp$ec)
+copy$st[which(is.na(test.pre.df$st)==T)] <- rowMeans(tmp.imp$imp$st)
+copy$q[which(is.na(test.pre.df$q)==T)] <- rowMeans(tmp.imp$imp$q)
+copy$bf[which(is.na(test.pre.df$bf)==T)] <- rowMeans(tmp.imp$imp$bf)
+
+plot.ts(copy$ec);plot.ts(test.pre.df$ec) #bad
+plot.ts(copy$st); plot.ts(test.pre.df$st) #bad
+plot.ts(copy$q); plot.ts(test.pre.df$q) 
+plot.ts(copy$bf); plot.ts(test.pre.df$bf)
+```
+
+missForest non-parametric imputation:
+```{r}
+imp.pre.forest <- missForest(test.pre.df, maxiter = 10)
+dim(imp.pre.forest$ximp)
+plot.ts(imp.pre.forest$ximp$ec);plot.ts(test.pre.df$ec) #bad due to extreme peaks
+plot.ts(imp.pre.forest$ximp$st); plot.ts(test.pre.df$st) #bad due to extreme peaks
+plot.ts(imp.pre.forest$ximp$q); plot.ts(test.pre.df$q) #okay
+```
+
+Use spline interpolation for EC, ST, Q, BF (more conservative):
+```{r}
+imp.pre.df <- na.kalman(test.pre.df)
+imp.pre.df <- na.interpolation(test.pre.df)
+plot.ts(imp.pre.df$ec);plot.ts(test.pre.df$ec) #good
+plot.ts(imp.pre.df$st);plot.ts(test.pre.df$st) #okay
+plot.ts(imp.pre.df$p);plot.ts(test.pre.df$p) # fine
+plot.ts(imp.pre.df$q);plot.ts(test.pre.df$q) # bad because of high baseflow
+plot.ts(imp.pre.df$bf);plot.ts(test.pre.df$bf) # bad
+
+plot.ts(imp.pre.df)
+```
+
+Summary thoughts:
+* MICE is probably best for Q and BF, because it doesn't distort baseflow
+* EC is probably best with spline
+* P works with most, spline is fine
+* ST doesn't look great with any, but spline avoids extreme peaks even if time series is not realistic
+```{r}
+pre.ec <- imp.pre.df$ec # spline
+pre.st <- imp.pre.df$st # spline
+pre.p <- imp.pre.df$p # spline
+pre.q <- copy$q #MICE
+pre.bf <- copy$bf #MICE
+```
+
+Make new dataframe: pre.final
+```{r}
+pre.final <- pre.df[-(1:305),]
+pre.final$ec <- pre.ec
+pre.final$st <- pre.st
+pre.final$p <- pre.p
+pre.final$q <- pre.q
+pre.final$bf <- pre.bf
+```
+
+### 2.2.2 Post-harvest data imputation
+
+Check dataframe:
+```{r}
+tail(post.df$ec,n=200) # drop the last 55 rows
+plot.ts(post.df$st) # gaps are not too big
+tail(post.df$st,n=200) # drop the last 55 rows
+```
+
+Subset data and check plots
+* drop last 55 rows
+* spline interpolation for ST (few gaps)
+* try different methods for EC (bigger gaps but not too bad)
+```{r}
+post.df <- post.df[-((nrow(post.df)-55):nrow(post.df)),]
+plot.ts(post.df$ec); plot.ts(post.df$st)
+```
+
+Spline interpolation:
+```{r}
+imp.post.df <- imp(post.df)
+plot.ts(imp.post.df$ec); plot.ts(post.df$ec); plot.ts(imp.post.df$st) #EC looks weird, ST is not totally gapfilled?
+plot.ts(imp.post.df$at); plot.ts(imp.post.df$p) #not good for at, P has negative values
+summary(imp.post.df)
+```
+
+```{r}
+#use the above imputed values for st
+post.df2 <- post.df; post.df2$st <- imp.post.df$st; post.df2$p <- imp.post.df$p
+summary(imp.post.df$p)
+summary(imp.post.df)
+summary(post.df2)
+```
+
+```{r}
+#remove negative prep, discharge, ec
+which(post.df2$p<0) #281, 692
+post.df2[which(post.df2$p<0),] #only p is neagtive
+post.df2$p[which(post.df2$p<0)] <- 0
+summary(post.df2$p) #good
+summary(post.df2)
+```
+
+```{r}
+#missforest
+imp.post.forest <- missForest(post.df2 %>% dplyr::select(ec,q,st,at,p,bf))
+imp.post.forest$OOBerror
+imp.post.forest <-imp.post.forest$ximp
+plot.ts(imp.post.forest$ec);plot.ts(post.df2$ec) #not so bad
+plot.ts(post.df2$q)
+plot.ts(imp.post.forest$at);plot.ts(post.df2$at) #good
+plot.ts(imp.post.forest$st) #no NAs here
+plot.ts(imp.post.forest)
+summary(imp.post.forest)
+```
+
+```{r}
+#MICE with PPM
+imp.post.mice <- mice(post.df2 %>% dplyr::select(ec,q,st,at,p,bf),m=10,maxit=50,seed=550)
+
+mice.post.ec <- rowMeans(imp.post.mice$imp$ec)
+mice.post.at <- rowMeans(imp.post.mice$imp$at)
+copy.ec <- post.df$ec
+copy.ec[which(is.na(post.df2$ec)==T)] <- mice.post.ec
+mice.post.ec <- copy.ec
+copy.at <- post.df$at
+copy.at[which(is.na(post.df2$at)==T)] <- mice.post.at
+mice.post.at <- copy.at
+plot.ts(mice.post.at)
+plot.ts(mice.post.ec); plot.ts(post.df$ec)
+```
+
+```{r}
+summary(post.df)
+```
+
+```{r}
+summary(imp.post.forest)
+```
+
+```{r}
+#combine spline interpolation, MICE, and missForest
+
+post.st <- imp.post.forest$st# missForest
+post.at <- mice.post.at # MICE with PPM
+post.p <- post.df2$p # spline
+post.q <- post.df$q
+post.bf <- post.df$bf
+post.ec <- mice.post.ec # MICE with PPM
+
+post.final <- post.df
+post.final$st <- post.st
+post.final$at <- post.at
+post.final$p <- post.p
+post.final$q <- post.q
+post.final$bf <- post.bf
+post.final$ec <- post.ec
+```
+
+```{r}
+summary(post.final)
+plot.ts(post.final)
+```
+
+```{r}
+full.final <- rbind(pre.final, post.final)
+```
+
+## 2.3 Baseflow separation
+```{r}
+full.final$q.gf <- ifelse(!is.na(full.final$q), full.final$q, mean(na.omit(full.final$q)))
+full.final$bf.gf <- BaseflowSeparation(full.final$q.gf, filter_parameter = 0.925, passes = 3)[,1] 
+full.final$bf <- ifelse(!is.na(full.final$q), full.final$bf.gf, NA)
+```
+
+# 3 EDA
+
+Discharge vs EC:
+```{r, warning=FALSE, echo=FALSE, fig.width=4, fig.height=8, fig.cap="The relation between Discharge and Electronical Conductivity"}
+attach(full.final)
+ggplot(data = full.final, aes(y = q, x = ec)) + 
+	labs(y="Discharge", x="Electronical Conductivity") + 
+	geom_point() + facet_grid(years ~ .) + ylim(c(0, 200))
+detach(full.final)
+```
+
+log EC vs log Q:
+```{r, message=FALSE, echo=FALSE, fig.width=4, fig.height=8, fig.cap="The relation between log(Discharge) and log(EC)"}
+attach(full.final)
+ggplot(data = full.final, aes(y = log(q), x = log(ec))) + ylab("log(Q)")+ xlab("log(EC)") + geom_point() + facet_grid(years ~.) 
+detach(full.final)
+```
+
+log EC vs stream temp:
+```{r, message=FALSE, echo=FALSE, fig.width=4, fig.height=8, fig.cap="The relation between log(EC) and Water Temperature"}
+attach(full.final)
+ggplot(data = full.final, aes(y = log(ec), x = st)) + ylab("log(EC)")+ xlab("Water Temperature") + geom_point() + facet_grid(years ~.)
+detach(full.final)
+```
+
+# 4 Statistical analysis
+
+## 4.1 Baseflow and EC
+
+```{r}
+stat.df$harvest <- ifelse(stat.df$dt < as.POSIXct('2011-2-01 00:00:00'), "preharvest", "postharvest")
+```
+
+```{r}
+attach(stat.df)
+ggplot(data = stat.df, aes(y = log(ec), x = bf)) + ylab("log(EC)")+ xlab("baseflow") + geom_point() + facet_grid(harvest ~.) + geom_smooth()
+detach(stat.df)
+```
+
+```{r}
+attach(stat.df)
+ggplot(data = stat.df, aes(y = ec, x = q, col = bf/q)) + 
+	ylab("log(EC)")+ xlab("baseflow") + geom_point() + facet_grid(season ~ harvest)  #geom_smooth()
+detach(stat.df)
+```
+
+```{r}
+ggsave("BFvsEC_facet.pdf", height = 5, width = 7, units = "in")
+```
+
+```{r}
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+ggplot(preharvest.df, aes(ec)) +
+  stat_ecdf(mapping = aes(ec, colour = cbPalette[3]),
+    data = preharvest.df, n = NULL, geom = "line", size = 1.5) +
+  stat_ecdf(mapping = aes(ec, colour = cbPalette[2]),
+    data = postharvest.df, n = NULL, geom = "line", size = 1.5) +
+  labs(x="EC", y="Cumulative density", title="Cumulative density of EC") +
+  coord_cartesian(xlim = c(0, 10)) + 
+  scale_colour_manual(labels = c("Pre-harvest", "Post-harvest"), values = c(cbPalette[3],cbPalette[2])) +
+  #scale_linetype_manual(values = c(2, 1)) + 
+  theme_cowplot() + theme(legend.title=element_blank()) + 
+  coord_flip(xlim=c(0, 150), ylim=c(-0.01,1.01))
+```
+
+```{r, message=FALSE, echo=FALSE, fig.width=4, fig.height=8, fig.cap="The relation between log(EC) and Water Temperature"}
+attach(stat.df)
+ggplot(data = stat.df, aes(y = log(ec), x = bf)) + ylab("log(EC)")+ xlab("baseflow") + geom_point() + facet_grid(years ~.) + geom_smooth()
+detach(stat.df)
+```
+
+## 4.2 Flow-weighted means of EC
+
+```{r}
+# flow weighted means for pre and post harvest - Q
+wt.mean(preharvest.df$ec, preharvest.df$q)
+wt.mean(postharvest.df$ec, postharvest.df$q)
+
+wt.var(preharvest.df$ec, preharvest.df$q)
+wt.var(postharvest.df$ec, postharvest.df$q)
+
+wt.sd(preharvest.df$ec, preharvest.df$q)/sqrt(length(preharvest.df))
+wt.sd(postharvest.df$ec, postharvest.df$q)/sqrt(length(postharvest.df))
+```
+
+```{r}
+# flow weighted means for pre and post harvest - BF
+wt.mean(preharvest.df$ec, preharvest.df$bf)
+wt.mean(postharvest.df$ec, postharvest.df$bf)
+
+wt.var(preharvest.df$ec, preharvest.df$bf)
+wt.var(postharvest.df$ec, postharvest.df$bf)
+
+wt.sd(preharvest.df$ec, preharvest.df$bf)/sqrt(length(preharvest.df))
+wt.sd(postharvest.df$ec, postharvest.df$bf)/sqrt(length(postharvest.df))
+```
+
+```{r}
+# flow weighted means for winter pre and post harvest - Q
+pre.winter <- subset(preharvest.df, format(dt,'%m') %in% c("11", "12", "01", "02", "03"))
+post.winter <- subset(postharvest.df, format(dt,'%m') %in% c("11", "12", "01", "02", "03"))
+
+wt.mean(pre.winter$ec, pre.winter$q)
+wt.mean(post.winter$ec, post.winter$q)
+
+wt.var(pre.winter$ec, pre.winter$q)
+wt.var(post.winter$ec, post.winter$q)
+
+wt.sd(pre.winter$ec, pre.winter$q)/sqrt(length(pre.winter))
+wt.sd(post.winter$ec, post.winter$q)/sqrt(length(post.winter))
+
+```
+
+```{r}
+# flow weighted means for winter pre and post harvest - BF
+wt.mean(pre.winter$ec, pre.winter$bf)
+wt.mean(post.winter$ec, post.winter$bf)
+
+wt.var(pre.winter$ec, pre.winter$bf)
+wt.var(post.winter$ec, post.winter$bf)
+
+wt.sd(pre.winter$ec, pre.winter$bf)/sqrt(length(pre.winter))
+wt.sd(post.winter$ec, post.winter$bf)/sqrt(length(post.winter))
+
+```
+
+```{r}
+# flow weighted means for summer pre and post harvest - Q
+pre.summer <- subset(preharvest.df, format(dt,'%m') %in% c("06", "07", "09"))
+post.summer <- subset(postharvest.df, format(dt,'%m') %in% c("06", "07", "09"))
+
+wt.mean(pre.summer$ec, pre.summer$q)
+wt.mean(post.summer$ec, post.summer$q)
+
+wt.var(pre.summer$ec, pre.summer$q)
+wt.var(post.summer$ec, post.summer$q)
+
+wt.sd(pre.summer$ec, pre.summer$q)/sqrt(length(pre.summer))
+wt.sd(post.summer$ec, post.summer$q)/sqrt(length(post.summer))
+```
+
+```{r}
+# flow weighted means for summer pre and post harvest - BF
+wt.mean(pre.summer$ec, pre.summer$bf)
+wt.mean(post.summer$ec, post.summer$bf)
+
+wt.var(pre.summer$ec, pre.summer$bf)
+wt.var(post.summer$ec, post.summer$bf)
+
+wt.sd(pre.summer$ec, pre.summer$bf)/sqrt(length(pre.summer))
+wt.sd(post.summer$ec, post.summer$bf)/sqrt(length(post.summer))
+```
+
+```{r}
+# flow weighted means for nov pre and post harvest - Q
+pre.nov <- subset(preharvest.df, format(dt,'%m') %in% c("11"))
+post.nov <- subset(postharvest.df, format(dt,'%m') %in% c("11"))
+
+wt.mean(pre.nov$ec, pre.nov$q)
+wt.mean(post.nov$ec, post.nov$q)
+
+wt.var(pre.nov$ec, pre.nov$q)
+wt.var(post.nov$ec, post.nov$q)
+
+wt.sd(pre.nov$ec, pre.nov$q)/sqrt(length(pre.nov))
+wt.sd(post.nov$ec, post.nov$q)/sqrt(length(post.nov))
+```
+
+```{r}
+# flow weighted means for nov pre and post harvest - BF
+wt.mean(pre.nov$ec, pre.nov$bf)
+wt.mean(post.nov$ec, post.nov$bf)
+
+wt.var(pre.nov$ec, pre.nov$bf)
+wt.var(post.nov$ec, post.nov$bf)
+
+wt.sd(pre.nov$ec, pre.nov$bf)/sqrt(length(pre.nov))
+wt.sd(post.nov$ec, post.nov$bf)/sqrt(length(post.nov))
+```
+
+```{r}
+# flow weighted means for each summer
+summer2009 <- subset(pre.summer, format(dt,'%Y') %in% c("2009"))
+summer2010 <- subset(pre.summer, format(dt,'%Y') %in% c("2010"))
+summer2011 <- subset(post.summer, format(dt,'%Y') %in% c("2011"))
+summer2012 <- subset(post.summer, format(dt,'%Y') %in% c("2012"))
+summer2013 <- subset(post.summer, format(dt,'%Y') %in% c("2013"))
+summer2014 <- subset(post.summer, format(dt,'%Y') %in% c("2014"))
+
+wt.mean(summer2009$ec, summer2009$q)
+wt.mean(summer2010$ec, summer2010$q)
+wt.mean(summer2011$ec, summer2011$q)
+wt.mean(summer2012$ec, summer2012$q)
+wt.mean(summer2013$ec, summer2013$q)
+wt.mean(summer2014$ec, summer2014$q)
+
+wt.var(summer2009$ec, summer2009$q)
+wt.var(summer2010$ec, summer2010$q)
+wt.var(summer2011$ec, summer2011$q)
+wt.var(summer2012$ec, summer2012$q)
+wt.var(summer2013$ec, summer2013$q)
+wt.var(summer2014$ec, summer2014$q)
+
+wt.sd(summer2009$ec, summer2009$q)
+wt.sd(summer2010$ec, summer2010$q)
+wt.sd(summer2011$ec, summer2011$q)
+wt.sd(summer2012$ec, summer2012$q)
+wt.sd(summer2013$ec, summer2013$q)
+wt.sd(summer2014$ec, summer2014$q)
+```
+
+```{r}
+# flow weighted means for each winter
+winter2009 <- subset(pre.winter, format(dt,'%Y') %in% c("2009"))
+winter2010 <- subset(pre.winter, format(dt,'%Y') %in% c("2010"))
+winter2011 <- subset(post.winter, format(dt,'%Y') %in% c("2011"))
+winter2012 <- subset(post.winter, format(dt,'%Y') %in% c("2012"))
+winter2013 <- subset(post.winter, format(dt,'%Y') %in% c("2013"))
+winter2014 <- subset(post.winter, format(dt,'%Y') %in% c("2014"))
+
+wt.mean(winter2009$ec, winter2009$q)
+wt.mean(winter2010$ec, winter2010$q)
+wt.mean(winter2011$ec, winter2011$q)
+wt.mean(winter2012$ec, winter2012$q)
+wt.mean(winter2013$ec, winter2013$q)
+wt.mean(winter2014$ec, winter2014$q)
+
+wt.var(winter2009$ec, winter2009$q)
+wt.var(winter2010$ec, winter2010$q)
+wt.var(winter2011$ec, winter2011$q)
+wt.var(winter2012$ec, winter2012$q)
+wt.var(winter2013$ec, winter2013$q)
+wt.var(winter2014$ec, winter2014$q)
+
+wt.sd(winter2009$ec, winter2009$q)
+wt.sd(winter2010$ec, winter2010$q)
+wt.sd(winter2011$ec, winter2011$q)
+wt.sd(winter2012$ec, winter2012$q)
+wt.sd(winter2013$ec, winter2013$q)
+wt.sd(winter2014$ec, winter2014$q)
+```
+
+## 4.3 Rolling sum selection
+
+```{r, message=FALSE, echo=FALSE}
+attach(pre.final)
+attach(post.final)
+pre.rs_selection <- function(x)
+{ 
+  log.ec.pre <- log(pre.final$ec[-c(1:x)])
+  sqrt.ec.pre <- sqrt(pre.final$ec[-c(1:x)])
+  st.pre <- pre.final$st[-c(1:x)]
+  log.q.pre <- log(pre.final$q)[-c(1:x)]
+  sqrt.q.pre <- sqrt(pre.final$q)[-c(1:x)]
+  pre.final <- pre.final %>% mutate(roll_sum=rollsum(p,(x+1),fill=NA),align="right")
+  p.pre <- pre.final$roll_sum[-c(1:x)]
+  lm1 <- summary(lm(log.ec.pre~p.pre+st.pre))
+  lm2 <- summary(lm(sqrt.ec.pre~p.pre+st.pre))
+  lm3 <- summary(lm(log.q.pre~p.pre+st.pre))
+  lm4 <- summary(lm(sqrt.q.pre~p.pre+st.pre))
+  c(lm1$adj.r.squared,lm2$adj.r.squared,lm3$adj.r.squared,lm4$adj.r.squared)
+}
+
+
+post.rs_selection <- function(x)
+{ 
+  log.ec.post <- log(post.final$ec[-c(1:x)])
+  sqrt.ec.post <- sqrt(post.final$ec[-c(1:x)])
+  st.post <- post.final$st[-c(1:x)]
+  log.q.post <- log(post.final$q)[-c(1:x)]
+  sqrt.q.post <- sqrt(post.final$q)[-c(1:x)]
+  post.final <- post.final %>% mutate(roll_sum=rollsum(p,(x+1),fill=NA),align="right")
+  p.post <- post.final$roll_sum[-c(1:x)] 
+  lm1 <- summary(lm(log.ec.post~st.post+p.post))
+  lm2 <- summary(lm(sqrt.ec.post~st.post+p.post))
+  lm3 <- summary(lm(log.q.post~st.post+p.post))
+  lm4 <- summary(lm(sqrt.q.post~st.post+p.post))
+  c(lm1$adj.r.squared,lm2$adj.r.squared,lm3$adj.r.squared,lm4$adj.r.squared)
+}
+
+pre.rs_selection3 <- function(x)
+{ 
+  m=nrow(pre.final)
+  log.ec.pre <- log(pre.final$ec[-c(1:x)])
+  sqrt.ec.pre <- sqrt(pre.final$ec[-c(1:x)])
+  st.pre <- pre.final$st[-c(1:x)]
+  log.q.pre <- log(pre.final$q)[-c(1:x)]
+  sqrt.q.pre <- sqrt(pre.final$q)[-c(1:x)]
+  pre.final <- pre.final %>% mutate(roll_sum=rollsum(p,(x+1),fill=NA),align="right")
+  p.pre <- pre.final$roll_sum[-c(1:x)]
+  lm1 <- lm(log.ec.pre~st.pre+p.pre)
+  lm2 <- lm(sqrt.ec.pre~st.pre+p.pre)
+  lm3 <- lm(log.q.pre~st.pre+p.pre)
+  lm4 <- lm(sqrt.q.pre~st.pre+p.pre)
+  c(BIC(lm1)/(m-x),BIC(lm2)/(m-x),BIC(lm3)/(m-x),BIC(lm4)/(m-x))
+}
+
+post.rs_selection3 <- function(x)
+{ 
+  n=nrow(post.final)
+  log.ec.post <- log(post.final$ec[-c(1:x)])
+  sqrt.ec.post <- sqrt(post.final$ec[-c(1:x)])
+  st.post <- post.final$st[-c(1:x)]
+  log.q.post <- log(post.final$q)[-c(1:x)]
+  sqrt.q.post <- sqrt(post.final$q)[-c(1:x)]
+  post.final <- post.final %>% mutate(roll_sum=rollsum(p,(x+1),fill=NA),align="right")
+  p.post <- post.final$roll_sum[-c(1:x)]
+  lm1 <- lm(log.ec.post~st.post+p.post)
+  lm2 <- lm(sqrt.ec.post~st.post+p.post)
+  lm3 <- lm(log.q.post~st.post+p.post)
+  lm4 <- lm(sqrt.q.post~st.post+p.post)
+  c(BIC(lm1)/(n-x),BIC(lm2)/(n-x),BIC(lm3)/(n-x),BIC(lm4)/(n-x))
+}
+
+detach(pre.final)
+detach(post.final)
+```
+
+```{r, message=FALSE, echo=FALSE, fig.width=8, fig.height=4, fig.cap="scaled Adjusted R^2 & BIC of linear regression of EC on WT and rolling sum of P of pre-harvest data"}
+attach(pre.final)
+tmp1=c()
+tmp2=c()
+for (i in 1:20)
+{
+  tmp1=rbind(tmp1,pre.rs_selection(i))
+  tmp2=rbind(tmp2,pre.rs_selection3(i))
+}
+x <- c(1:20)
+plot(x,tmp1[,1]-0.5,type='l',col=1, ylim=c(0.18,0.23),xlab="x-rolling sum",ylab="BIC")
+lines(x,-tmp2[,1],type='l',col=2)
+legend("bottom",legend=c("Adjusted R^2","BIC"),col=c(1,2),lty=c(1,1))
+detach(pre.final)
+```
+
+```{r, message=FALSE, echo=FALSE, fig.width=8, fig.height=4, fig.cap="scaled Adjusted R^2 & BIC of linear regression of Q on WT and rolling sum of P of pre-harvest data"}
+attach(pre.final)
+tmp1=c()
+tmp2=c()
+for (i in 1:20)
+{
+  tmp1=rbind(tmp1,pre.rs_selection(i))
+  tmp2=rbind(tmp2,pre.rs_selection3(i))
+}
+plot(x,tmp1[,3]-3.7,type='l',col=1,xlab="x-rolling sum",ylab="BIC")
+lines(x,-tmp2[,3],type='l',col=2)
+legend("bottom",legend=c("Adjusted R^2","BIC"),col=c(1,2),lty=c(1,1))
+detach(pre.final)
+```
+
+```{r, message=FALSE, echo=FALSE, fig.width=8, fig.height=4, fig.cap="scaled Adjusted R^2 & BIC of linear regression of EC on WT and rolling sum of P of post-harvest data"}
+attach(post.final)
+tmp3=c()
+tmp4=c()
+for (i in 1:20)
+{
+  tmp3=rbind(tmp3,post.rs_selection(i))
+  tmp4=rbind(tmp4,post.rs_selection3(i))
+}
+x <- c(1:20)
+plot(x,tmp3[,2]-2.22,type='l',col=1, ylim=c(-1.55,-1.485),xlab="x-rolling sum",ylab="Adjusted R^2 & BIC")
+lines(x,-tmp4[,2],type='l',col=2)
+legend("bottom",legend=c("Adjusted R^2","BIC"),col=c(1,2),lty=c(1,1))
+detach(post.final)
+```
+
+```{r, message=FALSE, echo=FALSE, fig.width=8, fig.height=4, fig.cap="scaled Adjusted R^2 & BIC of linear regression of Q on WT and rolling sum of P of post-harvest data"}
+attach(post.final)
+tmp3=c()
+tmp4=c()
+for (i in 1:20)
+{
+  tmp3=rbind(tmp3,post.rs_selection(i))
+  tmp4=rbind(tmp4,post.rs_selection3(i))
+}
+x <- c(1:20)
+plot(x,tmp3[,4]-4.78,type='l',col=1,xlab="x-rolling sum",ylab="BIC")
+lines(x,-tmp4[,4],type='l',col=2)
+legend("bottom",legend=c("Adjusted R^2","BIC"),col=c(1,2),lty=c(1,1))
+detach(post.final)
+```
+
+## 4.4 Linear regression
+
+```{r}
+attach(full.final)
+inds2 <- seq(as.Date("2009-04-23"), as.Date("2014-09-25"), by = "day")
+
+par(mfrow=c(3,2)) # Create a 3x2 plot
+plot(ts(ec,start = c(2009, as.numeric(format(inds2[1], "%j"))),
+	frequency = 365), ylab='Electrical Conductivity'); plot(ts(q,start = c(2009, as.numeric(format(inds2[1], "%j"))),
+	frequency = 365), ylab = 'Discharge'); plot(ts(st,start = c(2009, as.numeric(format(inds2[1], "%j"))),
+	frequency = 365), ylab = 'Water Temperature')
+
+plot(ts(p,start = c(2009, as.numeric(format(inds2[1], "%j"))),
+	frequency = 365), ylab = 'Precipitation'); plot(ts(at,start = c(2009, as.numeric(format(inds2[1], "%j"))),
+	frequency = 365), ylab="Air Temperature")
+detach(full.final)
+```
+
+```{r}
+#preharvest analysis
+attach(pre.final)
+log.ec <- log(ec)
+p.rs <- rollsum(p, k=2, align='right', na.pad=T) #k is chosen by Boyi's lag analysis
+lm.ec <- lm(log.ec ~ wt + p.rs); summ.ec <- summary(lm.ec)
+log.q <- log(q)
+lm.q <- lm(log.q ~ wt + p.rs); summ.q <- summary(lm.q)
+detach(pre.final)
+```
+
+```{r}
+#postharvest analysis
+attach(post.final)
+log.ec <- log(ec)
+p.rs <- rollsum(p, k=4, align='right', na.pad=T)  #k is chosen by Boyi's lag analysis
+lm.ec2 <- lm(log.ec ~ wt + p.rs); summ.ec2 <- summary(lm.ec2)
+log.q <- log(q)
+lm.q2 <- lm(log.q ~ wt + p.rs); summ.q2 <- summary(lm.q2)
+detach(post.final)
+```
+
+```{r}
+#ccf plots
+attach(pre.final)
+ccf(ec, q, lag.max=50, main="Pre EC vs. Discharge")
+detach(pre.final)
+attach(post.final)
+ccf(ec, q, lag.max=50, main="Post EC vs. Discharge")
+detach(post.final)
+ccf(lm.ec$res, lm.q$res, lag.max=50, main="Pre EC vs. Q Resids")
+ccf(lm.ec2$res, lm.q2$res, lag.max=50, main="Post EC vs. Q Resids")
+par(mfrow=c(1,1))
+```
+
+## 4.5 Time series analysis
+
+```{r, echo=F,include=F}
+# Create full time series
+full.final <- rbind(pre.final, post.final)
+head(full.final)
+colnames(full.final) <- c('X', 'dt', 'dayofyear', 'ec', 'q', 'wt', 'airtmp', 'p')
+full.final$dt <- as.Date(full.final$dt, format="%Y-%m-%d", origin='2009-04-23')
+
+attach(full.final) # this updates the global variables with the replaced data
+pre.final <- full.final[1:nrow(pre.final),]
+post.final <- full.final[-1:-nrow(pre.final),]
+detach(full.final)
+```
+
+PACF plots:
+* Modeling dependence structure of EC and discharge
+* AR(1) process seems likely - drop in partial correlation coefficient after lag 1; slowly decaying acf
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+attach(pre.final)
+par(mfrow=c(2,2))
+acf(ec, type='partial', ylim=c(0, 1))
+acf(q, type='partial', ylim=c(0, 1))
+acf(ec, type='correlation', ylim=c(0, 1))
+acf(q, type='correlation', ylim=c(0, 1))
+par(mfrow=c(1,1))
+detach(pre.final)
+```
+
+## 4.6 Regression Analysis
+
+Compare confidence intervals of pre- and post-harvest EC regression coefficients:
+```{r, echo=FALSE, fig.width=12}
+attach(pre.final)
+log.ec <- log(ec)
+lm.ec <- lm(log.ec[-1] ~ log.ec[-length(log.ec)] + wt[-1]); summ.ec <- summary(lm.ec)
+ec.coef <- round(summ.ec$coef, 4)
+rownames(ec.coef) <- c('Intercept', 'log(EC).t-1', 'WT')
+
+log.q <- log(q)
+lm.q <- lm(log.q[-1] ~ log.q[-length(log.q)] + wt[-1]); summ.q <- summary(lm.q)
+q.coef <- round(summ.q$coef, 4)
+rownames(q.coef) <- c('Intercept', 'log(Q).t-1', 'WT')
+detach(pre.final)
+
+attach(post.final)
+log.ec2 <- log(ec)
+lm.ec2 <- lm(log.ec2[-1] ~ log.ec2[-length(log.ec2)] + wt[-1]); summ.ec2 <- summary(lm.ec2)
+ec.coef2 <- round(summ.ec2$coef, 4)
+rownames(ec.coef2) <- c('Intercept', 'log(EC).t-1', 'WT')
+
+log.q2 <- log(q)
+lm.q2 <- lm(log.q2[-1] ~ log.q2[-length(log.q2)] + wt[-1]); summ.q2 <- summary(lm.q2)
+q.coef2 <- round(summ.q2$coef, 4)
+rownames(q.coef2) <- c('Intercept', 'log(Q).t-1', 'WT')
+detach(post.final)
+
+kable(ec.coef, caption='Pre-Harvest EC Regression Results')
+kable(ec.coef2, caption='Post-Harvest EC Regression Results')
+```
+
+Compare confidence intervals of pre- and post-harvest Q regression coefficients:
+```{r, echo=FALSE}
+kable(q.coef, caption='Pre-Harvest Q Regression Results')
+kable(q.coef2, caption='Post-Harvest Q Regression Results')
+```
+
+## 4.7 Cross-Correlation
+
+EC regression residual analysis:
+```{r, fig.align='center', echo=FALSE, fig.height=5, fig.width=12}
+inds <- seq(as.Date("2009-04-23"), as.Date("2011-01-31"), by = "day")
+lm.ec.res <- ts(lm.ec$res, start = c(2009, as.numeric(format(inds[1], "%j"))),
+           frequency = 365)
+
+inds2 <- seq(as.Date("2011-02-01"), as.Date("2014-09-25"), by = "day")
+lm.ec.res2 <- ts(lm.ec2$res, start = c(2011, as.numeric(format(inds2[1], "%j"))),
+           frequency = 365)
+
+par(mfrow=c(2,1))
+plot(lm.ec.res, main="EC Residuals Pre-Harvest", ylim=c(-0.7, 0.7),
+     ylab="EC Resid")
+plot(lm.ec.res2, main="EC Residuals Post-Harvest", ylim=c(-0.7, 0.7),
+     ylab="EC Resid")
+par(mfrow=c(1,1))
+```
+
+Q regression residual analysis:
+```{r, echo=FALSE, fig.align='center', fig.height=5.5, fig.width=12}
+lm.q.res <- ts(lm.q$res, start = c(2009, as.numeric(format(inds[1], "%j"))),
+           frequency = 365)
+
+inds2 <- seq(as.Date("2011-02-01"), as.Date("2014-09-25"), by = "day")
+lm.q.res2 <- ts(lm.q2$res, start = c(2011, as.numeric(format(inds2[1], "%j"))),
+           frequency = 365)
+
+par(mfrow=c(2,1))
+plot(lm.q.res, main="Q Residuals Pre-Harvest", ylab="Q Resid", ylim=c(-2, 3))
+plot(lm.q.res2, main="Q Residuals Post-Harvest", ylab="Q Resid", ylim=c(-2, 3))
+par(mfrow=c(1,1))
+```
+
+CCF of residuals:
+```{r, echo=FALSE, fig.align='center', fig.height=5.5, fig.width=10}
+par(mfrow=c(2,2))
+attach(pre.final)
+ccf(ec, q, lag.max=50, main="Raw EC vs. Q Pre-Harvest", ylim=c(-0.7, 0.1))
+detach(pre.final)
+attach(post.final)
+ccf(ec, q, lag.max=50, main="Raw EC vs. Q Post-Harvest", ylim=c(-0.7, 0.1))
+detach(post.final)
+ccf(lm.ec$res, lm.q$res, lag.max=50, main="EC vs. Q Residuals Pre-Harvest",
+    ylim=c(-0.4, 0.2))
+ccf(lm.ec2$res, lm.q2$res, lag.max=50, main="EC vs. Q Residuals Post-Harvest",
+    ylim=c(-0.4, 0.2))
+par(mfrow=c(1,1))
+```
